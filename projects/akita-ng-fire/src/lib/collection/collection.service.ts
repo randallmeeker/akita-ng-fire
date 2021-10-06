@@ -1,12 +1,26 @@
 import { inject } from '@angular/core';
 import {
-  AngularFirestoreCollection,
-  AngularFirestore,
-  DocumentChangeAction,
-  QueryFn,
-  QueryGroupFn,
   Query,
-} from '@angular/fire/compat/firestore';
+  DocumentReference,
+  CollectionReference,
+  Transaction,
+  Firestore,
+  collection,
+  doc,
+  collectionData,
+  query,
+  where,
+  WriteBatch,
+  runTransaction,
+  getDoc,
+  writeBatch,
+  docData,
+  getDocs,
+  QueryDocumentSnapshot,
+  fromRef,
+  collectionGroup,
+  collectionChanges,
+} from '@angular/fire/firestore';
 import {
   EntityStore,
   withTransaction,
@@ -14,7 +28,14 @@ import {
   ActiveState,
   getEntityType,
 } from '@datorama/akita';
-import firebase from 'firebase/compat/app';
+
+import {
+  AngularFirestoreCollection,
+  DocumentChangeAction,
+  QueryFn,
+  QueryGroupFn,
+} from '@angular/fire/compat/firestore';
+
 import { getIdAndPath } from '../utils/id-or-path';
 import {
   syncStoreFromDocAction,
@@ -45,19 +66,17 @@ export type CollectionState<E = any> = EntityState<E, string> &
 export type DocOptions = { path: string } | { id: string };
 
 export type GetRefs<idOrQuery> = idOrQuery extends (infer I)[]
-  ? firebase.firestore.DocumentReference[]
+  ? DocumentReference[]
   : idOrQuery extends string
-  ? firebase.firestore.DocumentReference
-  : firebase.firestore.CollectionReference;
+  ? DocumentReference
+  : CollectionReference;
 
 function isArray<E>(entityOrArray: E | E[]): entityOrArray is E[] {
   return Array.isArray(entityOrArray);
 }
 
 /** check is an Atomic write is a transaction */
-export function isTransaction(
-  write: AtomicWrite
-): write is firebase.firestore.Transaction {
+export function isTransaction(write: AtomicWrite): write is Transaction {
   return write && !!write['get'];
 }
 
@@ -69,7 +88,7 @@ export class CollectionService<
   private idsToListen: Record<string, string[]> = {};
   private memoPath: Record<string, Observable<EntityType>> = {};
   private memoQuery: Map<Query, Observable<EntityType[]>> = new Map();
-  protected db: AngularFirestore;
+  protected db: Firestore;
 
   protected onCreate?(entity: EntityType, options: WriteOptions): any;
   protected onUpdate?(entity: Partial<EntityType>, options: WriteOptions): any;
@@ -79,13 +98,13 @@ export class CollectionService<
   protected useMemorization = false;
 
   public createId() {
-    return this.db.createId();
+    return doc(collection(this.db, '_')).id;
   }
 
   constructor(
     protected store?: EntityStore<S>,
     private collectionPath?: string,
-    db?: AngularFirestore
+    db?: Firestore
   ) {
     if (
       !hasChildGetter(this, CollectionService, 'path') &&
@@ -95,7 +114,7 @@ export class CollectionService<
       throw new Error('You should provide a path to the collection');
     }
     try {
-      this.db = db || inject(AngularFirestore);
+      this.db = db || inject(Firestore);
     } catch (err) {
       throw new Error('CollectionService requires AngularFirestore.');
     }
@@ -112,9 +131,9 @@ export class CollectionService<
       }
       return this.memoPath[key];
     } else {
-      for (const query of this.memoQuery.keys()) {
-        if (typeof query !== 'string' && query.isEqual(key)) {
-          return this.memoQuery.get(query)!;
+      for (const _query of this.memoQuery.keys()) {
+        if (typeof _query !== 'string' && _query.isEqual(key)) {
+          return this.memoQuery.get(_query)!;
         }
       }
       this.memoQuery.set(key, cb().pipe(shareWithDelay()));
@@ -159,8 +178,11 @@ export class CollectionService<
    * The Angular Fire collection
    * @notice If path is an observable, it becomes an observable.
    */
-  get collection(): AngularFirestoreCollection<EntityType> {
-    return this.db.collection<EntityType>(this.currentPath);
+  get collection(): CollectionReference<EntityType> {
+    return collection(
+      this.db,
+      this.currentPath
+    ) as CollectionReference<EntityType>;
   }
 
   /**
@@ -204,7 +226,7 @@ export class CollectionService<
    */
   syncCollection(
     // tslint:disable-next-line: unified-signatures
-    query: QueryFn,
+    _query: QueryFn,
     syncOptions?: Partial<SyncOptions>
   ): Observable<DocumentChangeAction<EntityType>[]>;
   /**
@@ -254,21 +276,18 @@ export class CollectionService<
       setLoading(storeName, true);
     }
     // Start Listening
-    return this.db
-      .collection<EntityType>(path, queryFn)
-      .stateChanges()
-      .pipe(
-        withTransaction((actions) =>
-          syncStoreFromDocAction(
-            storeName,
-            actions,
-            this.idKey,
-            this.resetOnUpdate,
-            this.mergeRef,
-            (entity) => this.formatFromFirestore(entity)
-          )
+    return collectionChanges(query(collection(this.db, path), queryFn)).pipe(
+      withTransaction((actions) =>
+        syncStoreFromDocAction(
+          storeName,
+          actions,
+          this.idKey,
+          this.resetOnUpdate,
+          this.mergeRef,
+          (entity) => this.formatFromFirestore(entity)
         )
-      );
+      )
+    ) as Observable<DocumentChangeAction<EntityType>[]>;
   }
 
   /**
@@ -300,12 +319,12 @@ export class CollectionService<
     syncOptions: Partial<SyncOptions> = { loading: true }
   ): Observable<DocumentChangeAction<EntityType>[]> {
     let path: string;
-    let query: QueryGroupFn<EntityType>;
+    let _query: QueryGroupFn<EntityType>;
     if (typeof idOrQuery === 'string') {
       path = idOrQuery;
     } else if (typeof idOrQuery === 'function') {
       path = this.currentPath;
-      query = idOrQuery;
+      _query = idOrQuery;
     } else if (typeof idOrQuery === 'object') {
       path = this.currentPath;
       syncOptions = idOrQuery;
@@ -316,7 +335,7 @@ export class CollectionService<
     }
 
     if (typeof queryOrOption === 'function') {
-      query = queryOrOption;
+      _query = queryOrOption;
     } else if (typeof queryOrOption === 'object') {
       syncOptions = queryOrOption;
     }
@@ -333,21 +352,20 @@ export class CollectionService<
     }
 
     const collectionId = path.split('/').pop();
-    return this.db
-      .collectionGroup<EntityType>(collectionId, query)
-      .stateChanges()
-      .pipe(
-        withTransaction((actions) =>
-          syncStoreFromDocAction(
-            storeName,
-            actions,
-            this.idKey,
-            this.resetOnUpdate,
-            this.mergeRef,
-            (entity) => this.formatFromFirestore(entity)
-          )
+    return collectionChanges(
+      _query(collectionGroup(this.db, collectionId), _query)
+    ).pipe(
+      withTransaction((actions) =>
+        syncStoreFromDocAction(
+          storeName,
+          actions,
+          this.idKey,
+          this.resetOnUpdate,
+          this.mergeRef,
+          (entity) => this.formatFromFirestore(entity)
         )
-      );
+      )
+    ) as Observable<DocumentChangeAction<EntityType>[]>;
   }
 
   /**
@@ -392,12 +410,12 @@ export class CollectionService<
         // Sync all docs
         const syncs = ids.map((id) => {
           const path = `${this.getPath(syncOptions)}/${id}`;
-          return this.db.doc<EntityType>(path).snapshotChanges();
+          return fromRef(doc(this.db, path));
         });
         return combineLatest(syncs).pipe(
           tap((actions) =>
             actions.map((action) => {
-              syncStoreFromDocActionSnapshot(
+              syncStoreFromDocActionSnapshot<EntityType>(
                 storeName,
                 action,
                 this.idKey,
@@ -433,25 +451,22 @@ export class CollectionService<
     if (syncOptions.loading) {
       setLoading(storeName, true);
     }
-    return this.db
-      .doc<EntityType>(path)
-      .valueChanges()
-      .pipe(
-        map((entity) => {
-          if (!entity) {
-            setLoading(storeName, false);
-            // note: We don't removeEntity as it would result in weird behavior
-            return undefined;
-          }
-          const data = this.formatFromFirestore({
-            [this.idKey]: id,
-            ...entity,
-          });
-          upsertStoreEntity(storeName, data, id);
+    return docData(doc(this.db, path)).pipe(
+      map((entity) => {
+        if (!entity) {
           setLoading(storeName, false);
-          return data;
-        })
-      );
+          // note: We don't removeEntity as it would result in weird behavior
+          return undefined;
+        }
+        const data = this.formatFromFirestore({
+          [this.idKey]: id,
+          ...entity,
+        });
+        upsertStoreEntity(storeName, data, id);
+        setLoading(storeName, false);
+        return data;
+      })
+    );
   }
 
   /**
@@ -489,17 +504,12 @@ export class CollectionService<
   ///////////////
 
   /** Return the reference of the document(s) or collection */
-  public getRef(
-    options?: Partial<SyncOptions>
-  ): firebase.firestore.CollectionReference;
+  public getRef(options?: Partial<SyncOptions>): CollectionReference;
   public getRef(
     ids?: string[],
     options?: Partial<SyncOptions>
-  ): firebase.firestore.DocumentReference[];
-  public getRef(
-    id?: string,
-    options?: Partial<SyncOptions>
-  ): firebase.firestore.DocumentReference;
+  ): DocumentReference[];
+  public getRef(id?: string, options?: Partial<SyncOptions>): DocumentReference;
   public getRef(
     idOrQuery?: string | string[] | Partial<SyncOptions>,
     options: Partial<SyncOptions> = {}
@@ -507,17 +517,15 @@ export class CollectionService<
     const path = this.getPath(options);
     // If path targets a collection ( odd number of segments after the split )
     if (typeof idOrQuery === 'string') {
-      return this.db.doc<EntityType>(`${path}/${idOrQuery}`).ref;
+      return doc(this.db, `${path}/${idOrQuery}`);
     }
     if (Array.isArray(idOrQuery)) {
-      return idOrQuery.map(
-        (id) => this.db.doc<EntityType>(`${path}/${id}`).ref
-      );
+      return idOrQuery.map((id) => doc(this.db, `${path}/${id}`));
     } else if (typeof idOrQuery === 'object') {
       const subpath = this.getPath(idOrQuery);
-      return this.db.collection<EntityType>(subpath).ref;
+      return collection(this.db, subpath);
     } else {
-      return this.db.collection<EntityType>(path, idOrQuery).ref;
+      return collection(this.db, path, idOrQuery);
     }
   }
 
@@ -529,7 +537,7 @@ export class CollectionService<
   ): Promise<EntityType[]>;
   // tslint:disable-next-line: unified-signatures
   public async getValue(
-    query?: QueryFn,
+    _query?: QueryFn,
     options?: Partial<SyncOptions>
   ): Promise<EntityType[]>;
   public async getValue(
@@ -543,9 +551,7 @@ export class CollectionService<
     const path = this.getPath(options);
     // If path targets a collection ( odd number of segments after the split )
     if (typeof idOrQuery === 'string') {
-      const snapshot = await this.db
-        .doc<EntityType>(`${path}/${idOrQuery}`)
-        .ref.get();
+      const snapshot = await getDoc(doc(this.db, `${path}/${idOrQuery}`));
       return snapshot.exists
         ? this.formatFromFirestore({
             ...snapshot.data(),
@@ -553,23 +559,23 @@ export class CollectionService<
           })
         : null;
     }
-    let docs: firebase.firestore.QueryDocumentSnapshot[];
+    let docs: QueryDocumentSnapshot[];
     if (Array.isArray(idOrQuery)) {
       docs = await Promise.all(
         idOrQuery.map((id) => {
-          return this.db.doc<EntityType>(`${path}/${id}`).ref.get();
+          return getDoc(doc(this.db, `${path}/${id}`));
         })
       );
     } else if (typeof idOrQuery === 'function') {
-      const { ref } = this.db.collection(path);
-      const snaphot = await idOrQuery(ref).get();
+      const ref = collection(this.db, path);
+      const snaphot = await getDocs(idOrQuery(ref));
       docs = snaphot.docs;
     } else if (typeof idOrQuery === 'object') {
       const subpath = this.getPath(idOrQuery);
-      const snapshot = await this.db.collection(subpath).ref.get();
+      const snapshot = await getDocs(collection(this.db, subpath));
       docs = snapshot.docs;
     } else {
-      const snapshot = await this.db.collection(path, idOrQuery).ref.get();
+      const snapshot = await getDocs(collection(this.db, path, idOrQuery));
       docs = snapshot.docs;
     }
     return docs
@@ -588,7 +594,7 @@ export class CollectionService<
   ): Observable<EntityType[]>;
   // tslint:disable-next-line: unified-signatures
   public valueChanges(
-    query?: QueryFn,
+    _query?: QueryFn,
     options?: Partial<PathParams>
   ): Observable<EntityType[]>;
   public valueChanges(
@@ -603,8 +609,8 @@ export class CollectionService<
     // If path targets a collection ( odd number of segments after the split )
     if (typeof idOrQuery === 'string') {
       const key = `${path}/${idOrQuery}`;
-      const query = () => this.db.doc<EntityType>(key).valueChanges();
-      return this.fromMemo(key, query).pipe(
+      const _query = () => docData(doc(this.db, key));
+      return this.fromMemo(key, _query).pipe(
         map((doc) => this.formatFromFirestore(doc))
       );
     }
@@ -613,25 +619,26 @@ export class CollectionService<
       if (!idOrQuery.length) return of([]);
       const queries = idOrQuery.map((id) => {
         const key = `${path}/${id}`;
-        const query = () => this.db.doc<EntityType>(key).valueChanges();
-        return this.fromMemo(key, query) as Observable<EntityType>;
+        const _query = () => docData(doc(this.db, key));
+        return this.fromMemo(key, _query) as Observable<EntityType>;
       });
       docs$ = combineLatest(queries);
     } else if (typeof idOrQuery === 'function') {
-      const query = idOrQuery(this.db.collection(path).ref);
-      const cb = () =>
-        this.db.collection<EntityType>(path, idOrQuery).valueChanges();
-      docs$ = this.fromMemo(query, cb);
+      const _query = idOrQuery(collection(this.db, path));
+      const cb = () => collectionData(collection(this.db, path, idOrQuery));
+      docs$ = this.fromMemo(_query, cb);
     } else if (typeof idOrQuery === 'object') {
       const subpath = this.getPath(idOrQuery);
-      const query = this.db.collection(subpath).ref;
-      const cb = () => this.db.collection<EntityType>(subpath).valueChanges();
-      docs$ = this.fromMemo(query, cb);
+      const _query = collection(this.db, subpath);
+      const cb = () => collectionData(_query, { idField: this.idKey });
+      docs$ = this.fromMemo(_query, cb);
     } else {
-      const query = this.db.collection(path).ref;
+      const _query = collection(this.db, path);
       const cb = () =>
-        this.db.collection<EntityType>(path, idOrQuery).valueChanges();
-      docs$ = this.fromMemo(query, cb);
+        collectionData(collection(_query, path, idOrQuery), {
+          idField: this.idKey,
+        });
+      docs$ = this.fromMemo(_query, cb);
     }
     return docs$.pipe(
       map((docs) => docs.map((doc) => this.formatFromFirestore(doc)))
@@ -647,17 +654,15 @@ export class CollectionService<
    * @note alias for `angularFirestore.firestore.batch()`
    */
   batch() {
-    return this.db.firestore.batch();
+    return writeBatch(this.db);
   }
 
   /**
    * Run a transaction
    * @note alias for `angularFirestore.firestore.runTransaction()`
    */
-  runTransaction(
-    cb: Parameters<firebase.firestore.Firestore['runTransaction']>[0]
-  ) {
-    return this.db.firestore.runTransaction((tx) => cb(tx));
+  runTransaction<T = any>(cb: (transaction: Transaction) => Promise<T>) {
+    return runTransaction(this.db, (tx) => cb(tx));
   }
 
   /**
@@ -673,7 +678,7 @@ export class CollectionService<
       const ref = this.getRef(doc[this.idKey] as string);
       const { exists } = await (isTransaction(options.write)
         ? options.write.get(ref)
-        : ref.get());
+        : getDoc(ref));
       return exists;
     };
     if (!isArray(documents)) {
@@ -709,11 +714,11 @@ export class CollectionService<
     ) as any;
     const { write = this.batch(), ctx } = options;
     const path = this.getPath(options);
-    const operations = docs.map(async (doc) => {
-      const id = doc[this.idKey] || this.db.createId();
-      const data = this.formatToFirestore({ ...doc, [this.idKey]: id });
-      const { ref } = this.db.doc(`${path}/${id}`);
-      (write as firebase.firestore.WriteBatch).set(ref, data);
+    const operations = docs.map(async (_doc) => {
+      const id = _doc[this.idKey] || this.createId();
+      const data = this.formatToFirestore({ ..._doc, [this.idKey]: id });
+      const ref = doc(this.db, `${path}/${id}`);
+      (write as WriteBatch).set(ref, data);
       if (this.onCreate) {
         await this.onCreate(data, { write, ctx });
       }
@@ -722,7 +727,7 @@ export class CollectionService<
     const ids = await Promise.all(operations);
     // If there is no atomic write provided
     if (!options.write) {
-      await (write as firebase.firestore.WriteBatch).commit();
+      await (write as WriteBatch).commit();
     }
     return Array.isArray(documents) ? ids : ids[0];
   }
@@ -738,7 +743,7 @@ export class CollectionService<
     const ids: string[] = Array.isArray(id) ? id : [id];
 
     const operations = ids.map(async (docId) => {
-      const { ref } = this.db.doc(`${path}/${docId}`);
+      const ref = doc(this.db, `${path}/${docId}`);
       write.delete(ref);
       if (this.onDelete) {
         await this.onDelete(docId, { write, ctx });
@@ -747,14 +752,14 @@ export class CollectionService<
     await Promise.all(operations);
     // If there is no atomic write provided
     if (!options.write) {
-      return (write as firebase.firestore.WriteBatch).commit();
+      return (write as WriteBatch).commit();
     }
   }
 
   /** Remove all document of the collection */
   async removeAll(options: WriteOptions = {}) {
     const path = this.getPath(options);
-    const snapshot = await this.db.collection(path).ref.get();
+    const snapshot = await collection(this.db, path).get();
     const ids = snapshot.docs.map((doc) => doc.id);
     return this.remove(ids, options);
   }
@@ -775,7 +780,7 @@ export class CollectionService<
     ids: string | string[],
     stateFunction: UpdateCallback<EntityType>,
     options?: WriteOptions
-  ): Promise<firebase.firestore.Transaction[]>;
+  ): Promise<Transaction[]>;
   async update(
     idsOrEntity:
       | Partial<EntityType>
@@ -787,7 +792,7 @@ export class CollectionService<
       | Partial<EntityType>
       | WriteOptions,
     options: WriteOptions = {}
-  ): Promise<void | firebase.firestore.Transaction[]> {
+  ): Promise<void | Transaction[]> {
     let ids: string[] = [];
     let stateFunction: UpdateCallback<EntityType>;
     let getData: (docId: string) => Partial<EntityType>;
@@ -831,15 +836,15 @@ export class CollectionService<
 
     // If update depends on the entity, use transaction
     if (stateFunction) {
-      return this.db.firestore.runTransaction(async (tx) => {
+      return runTransaction(this.db, async (tx) => {
         const operations = ids.map(async (id) => {
-          const { ref } = this.db.doc(`${path}/${id}`);
+          const ref = doc(this.db, `${path}/${id}`);
           const snapshot = await tx.get(ref);
-          const doc = Object.freeze({
+          const _doc = Object.freeze({
             ...(snapshot.data() as Object),
             [this.idKey]: id,
           } as EntityType);
-          const data = await stateFunction(doc, tx);
+          const data = await stateFunction(_doc, tx);
           tx.update(ref, this.formatToFirestore(data));
           if (this.onUpdate) {
             await this.onUpdate(data, { write: tx, ctx });
@@ -851,22 +856,22 @@ export class CollectionService<
     } else {
       const { write = this.batch() } = options;
       const operations = ids.map(async (docId) => {
-        const doc = Object.freeze(getData(docId));
+        const _doc = Object.freeze(getData(docId));
         if (!docId) {
           throw new Error(
-            `Document should have an unique id to be updated, but none was found in ${doc}`
+            `Document should have an unique id to be updated, but none was found in ${_doc}`
           );
         }
-        const { ref } = this.db.doc(`${path}/${docId}`);
-        write.update(ref, this.formatToFirestore(doc));
+        const ref = doc(this.db, `${path}/${docId}`);
+        write.update(ref, this.formatToFirestore(_doc));
         if (this.onUpdate) {
-          await this.onUpdate(doc, { write, ctx });
+          await this.onUpdate(_doc, { write, ctx });
         }
       });
       await Promise.all(operations);
       // If there is no atomic write provided
       if (!options.write) {
-        return (write as firebase.firestore.WriteBatch).commit();
+        return (write as WriteBatch).commit();
       }
       return;
     }
